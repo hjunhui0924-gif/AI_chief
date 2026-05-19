@@ -1,9 +1,8 @@
 /* static/main.js */
-const STORAGE_META_KEY = "ai_chief_session_meta";
 const STORAGE_THREAD_KEY = "ai_chief_current_thread";
 const STORAGE_RECENT_COLLAPSED_KEY = "ai_chief_recent_collapsed";
 
-let sessionMetas = JSON.parse(localStorage.getItem(STORAGE_META_KEY) || "{}");
+let sessionMetas = {};
 let currentThreadId = localStorage.getItem(STORAGE_THREAD_KEY) || null;
 let recentCollapsed = localStorage.getItem(STORAGE_RECENT_COLLAPSED_KEY) === "1";
 
@@ -29,8 +28,7 @@ function updateSidebarState(open) {
     document.body.classList.toggle("sidebar-collapsed", !open);
 }
 
-function saveMetaToLocal() {
-    localStorage.setItem(STORAGE_META_KEY, JSON.stringify(sessionMetas));
+function saveCurrentThread() {
     localStorage.setItem(STORAGE_THREAD_KEY, currentThreadId || "");
 }
 
@@ -87,11 +85,45 @@ function renderEmptyState() {
     `;
 }
 
+function jumpChatToBottom() {
+    const previous = chatContainer.style.scrollBehavior;
+    chatContainer.style.scrollBehavior = "auto";
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+    chatContainer.style.scrollBehavior = previous;
+}
+
+function moveSessionToTop(threadId) {
+    if (!threadId || !sessionMetas[threadId]) {
+        return;
+    }
+
+    const session = sessionMetas[threadId];
+    const reordered = { [threadId]: session };
+    Object.keys(sessionMetas).forEach((id) => {
+        if (id !== threadId) {
+            reordered[id] = sessionMetas[id];
+        }
+    });
+    sessionMetas = reordered;
+}
+
+function isCurrentSessionEmptyNew() {
+    const hasMessages = Boolean(chatContainer.querySelector(".message-wrapper"));
+    return Boolean(currentThreadId)
+        && sessionMetas[currentThreadId]?.title === "新会话"
+        && !hasMessages;
+}
+
 function createNewSession() {
+    if (isCurrentSessionEmptyNew()) {
+        return;
+    }
+
     const newId = "thread_" + Math.random().toString(36).slice(2, 10);
     sessionMetas[newId] = { title: "新会话" };
     currentThreadId = newId;
-    saveMetaToLocal();
+    moveSessionToTop(newId);
+    saveCurrentThread();
     renderSessionList();
     renderEmptyState();
     if (isMobile()) updateSidebarState(false);
@@ -108,7 +140,7 @@ function escapeHtml(value) {
 
 function renderSessionList() {
     sessionListEl.innerHTML = "";
-    Object.keys(sessionMetas).reverse().forEach((id) => {
+    Object.keys(sessionMetas).forEach((id) => {
         const item = document.createElement("div");
         item.className = `session-item ${id === currentThreadId ? "active" : ""}`;
         item.innerHTML = `
@@ -133,7 +165,7 @@ function renderSessionList() {
 async function switchSession(id) {
     if (currentThreadId === id) return;
     currentThreadId = id;
-    saveMetaToLocal();
+    saveCurrentThread();
     renderSessionList();
     await loadAndRenderHistory(id);
     if (isMobile()) updateSidebarState(false);
@@ -151,16 +183,17 @@ async function deleteSession(id) {
     delete sessionMetas[id];
 
     if (Object.keys(sessionMetas).length === 0) {
-        saveMetaToLocal();
+        currentThreadId = null;
+        saveCurrentThread();
         createNewSession();
         return;
     }
 
     if (currentThreadId === id) {
-        currentThreadId = Object.keys(sessionMetas)[Object.keys(sessionMetas).length - 1];
+        currentThreadId = Object.keys(sessionMetas)[0];
     }
 
-    saveMetaToLocal();
+    saveCurrentThread();
     renderSessionList();
     await loadAndRenderHistory(currentThreadId);
 }
@@ -179,9 +212,11 @@ async function loadAndRenderHistory(id) {
                 appendMessageUI(
                     msg.role === "user" ? "user" : "bot",
                     msg.content,
-                    msg.image_url || null
+                    msg.image_url || null,
+                    false
                 );
             });
+            jumpChatToBottom();
         } else {
             renderEmptyState();
         }
@@ -192,7 +227,7 @@ async function loadAndRenderHistory(id) {
     }
 }
 
-function appendMessageUI(role, content, imgUrl = null) {
+function appendMessageUI(role, content, imgUrl = null, autoScroll = true) {
     const emptyState = chatContainer.querySelector(".empty-state");
     if (emptyState) emptyState.remove();
 
@@ -215,8 +250,43 @@ function appendMessageUI(role, content, imgUrl = null) {
 
     chatContainer.appendChild(wrapper);
     enhanceRenderedContent(wrapper);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (autoScroll) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
     return wrapper;
+}
+
+async function initializeSessions() {
+    try {
+        const response = await fetch("/sessions");
+        const data = await response.json();
+
+        sessionMetas = {};
+        if (data.status === "success" && Array.isArray(data.sessions)) {
+            data.sessions.forEach((session) => {
+                if (!session?.thread_id) return;
+                sessionMetas[session.thread_id] = { title: session.title || session.thread_id };
+            });
+        }
+    } catch (error) {
+        sessionMetas = {};
+        console.error("加载会话列表失败:", error);
+    }
+
+    const ids = Object.keys(sessionMetas);
+
+    if (ids.length === 0) {
+        createNewSession();
+        return;
+    }
+
+    if (!currentThreadId || !sessionMetas[currentThreadId]) {
+        currentThreadId = ids[0];
+    }
+
+    saveCurrentThread();
+    renderSessionList();
+    await loadAndRenderHistory(currentThreadId);
 }
 
 async function sendMessage() {
@@ -236,7 +306,6 @@ async function sendMessage() {
 
     if (sessionMetas[currentThreadId] && sessionMetas[currentThreadId].title === "新会话") {
         sessionMetas[currentThreadId].title = deriveSessionTitle(text, Boolean(file));
-        saveMetaToLocal();
         renderSessionList();
     }
 
@@ -255,6 +324,9 @@ async function sendMessage() {
     if (file) formData.append("image", file);
 
     try {
+        moveSessionToTop(currentThreadId);
+        renderSessionList();
+
         const messageWrapper = appendMessageUI("bot", "正在识别食材并整理推荐...");
         const textContainer = messageWrapper.querySelector(".text");
 
@@ -337,12 +409,6 @@ window.addEventListener("resize", () => {
     updateSidebarState(!isMobile());
 });
 
-if (!currentThreadId || !sessionMetas[currentThreadId]) {
-    createNewSession();
-} else {
-    renderSessionList();
-    loadAndRenderHistory(currentThreadId);
-}
-
 updateSidebarState(!isMobile());
 updateRecentSectionState();
+initializeSessions();

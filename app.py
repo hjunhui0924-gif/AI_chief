@@ -4,9 +4,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import HumanMessage
+from langchain.messages import AIMessage, AIMessageChunk, HumanMessage
 
-from agent import agent, delete_thread, get_messages
+from agent import agent, delete_thread, get_messages, list_threads
 from oss_utils import handle_image_upload
 
 load_dotenv()
@@ -20,50 +20,33 @@ STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def clean_model_output(text: str) -> str:
-    stripped = text.strip()
+def extract_renderable_content(content) -> str:
+    if isinstance(content, str):
+        return content
 
-    if stripped.startswith("{") and '"recipes"' in stripped:
-        return "已根据食材完成搜索，下面直接给你整理推荐结果。"
-
-    blocked_fragments = [
-        "Error invoking tool",
-        "include_domains",
-        "exclude_domains",
-        "time_range",
-        '"query":',
-        '"recipes":',
-        '"image_urls":'
-    ]
-    if any(fragment in text for fragment in blocked_fragments):
-        return "搜索过程已省略，下面直接给你整理推荐结果。"
-
-    return text
-
-
-def extract_display_text(text: str) -> str:
-    cleaned = clean_model_output(text)
-
-    blocked_prefixes = [
-        "{",
-        "搜索关键词：",
-        "候选菜谱：",
-        "1. 标题：",
-        "搜索过程已省略",
-        "已根据食材完成搜索"
-    ]
-    if any(cleaned.lstrip().startswith(prefix) for prefix in blocked_prefixes):
-        for marker in [
-            "### 基于食材的食谱建议报告",
-            "#### 一、当前可用食材",
-            "一、当前可用食材"
-        ]:
-            idx = cleaned.find(marker)
-            if idx != -1:
-                return cleaned[idx:]
+    if not isinstance(content, list):
         return ""
 
-    return cleaned
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text", "")
+            if text:
+                parts.append(text)
+            continue
+
+        if item_type == "image_url":
+            image_payload = item.get("image_url", {})
+            if isinstance(image_payload, dict):
+                image_url = image_payload.get("url", "")
+                if image_url:
+                    parts.append(f"\n\n![参考图]({image_url})\n")
+
+    return "".join(parts)
 
 
 @app.get("/")
@@ -72,9 +55,16 @@ def read_root():
         return HTMLResponse(content=f.read())
 
 
+@app.get("/sessions")
+def get_sessions():
+    try:
+        return {"status": "success", "sessions": list_threads()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/history/{thread_id}")
 def get_history(thread_id: str):
-    """获取指定会话的历史记录"""
     try:
         messages = get_messages(thread_id)
         return {"status": "success", "messages": messages}
@@ -84,7 +74,6 @@ def get_history(thread_id: str):
 
 @app.delete("/history/{thread_id}")
 def clear_history(thread_id: str):
-    """清除指定会话的历史记录"""
     try:
         delete_thread(thread_id)
         return {"status": "success"}
@@ -128,34 +117,41 @@ async def chat(
             try:
                 user_message = HumanMessage(content=content)
                 config = {"configurable": {"thread_id": thread_id}}
-                accumulated = ""
-                already_sent = ""
+                has_output = False
+                seen_text = ""
 
                 for chunk, _metadata in agent.stream(
                     {"messages": [user_message]},
                     config,
                     stream_mode="messages"
                 ):
-                    chunk_text = getattr(chunk, "content", "")
+                    if not isinstance(chunk, (AIMessageChunk, AIMessage)):
+                        continue
 
-                    if isinstance(chunk_text, str):
-                        accumulated += chunk_text
-                    elif isinstance(chunk_text, list):
-                        accumulated += "".join(
-                            item.get("text", "")
-                            for item in chunk_text
-                            if isinstance(item, dict) and item.get("type") == "text"
-                        )
+                    text = extract_renderable_content(chunk.content)
+                    if not text:
+                        continue
 
-                    display_text = extract_display_text(accumulated)
-                    if display_text and len(display_text) > len(already_sent):
-                        delta = display_text[len(already_sent):]
-                        already_sent = display_text
+                    if isinstance(chunk, AIMessageChunk):
+                        has_output = True
+                        seen_text += text
+                        yield text
+                        continue
+
+                    if not text.startswith(seen_text):
+                        has_output = True
+                        seen_text = text
+                        yield text
+                        continue
+
+                    delta = text[len(seen_text):]
+                    if delta:
+                        has_output = True
+                        seen_text = text
                         yield delta
 
-                if not already_sent:
-                    fallback = extract_display_text(accumulated) or "暂时没有生成结果，请再试一次。"
-                    yield fallback
+                if not has_output:
+                    yield "暂时没有生成结果，请再试一次。"
             except Exception as e:
                 yield f"\n\n**[服务运行错误或网络超时: {str(e)}]**"
 
@@ -171,4 +167,4 @@ async def chat(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

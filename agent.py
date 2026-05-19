@@ -16,7 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "resources" / "personal_chief.db"
 
 model = init_chat_model(
-    model="qwen3.6-plus",
+    model="qwen3.5-flash",
     model_provider="openai",
     base_url=os.getenv("DASHSCOPE_BASE_URL"),
     api_key=os.getenv("DASHSCOPE_API_KEY")
@@ -140,6 +140,50 @@ def get_messages(thread_id: str) -> list[dict[str, str]]:
                 result.append({"role": "user", "content": content})
         elif isinstance(msg, AIMessage):
             result.append({"role": "assistant", "content": msg.content})
+
+    return result
+
+
+def derive_session_title(messages: list[dict[str, str]]) -> str:
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+
+        content = str(message.get("content", "")).replace("\n", " ").strip()
+        if content and content != "[图片请求]":
+            return content[:12]
+        if message.get("image_url"):
+            return "图片识别"
+
+    return "新会话"
+
+
+def list_threads() -> list[dict[str, str]]:
+    rows = connection.execute(
+        """
+        SELECT thread_id, MAX(sort_rowid) AS latest_rowid
+        FROM (
+            SELECT thread_id, rowid AS sort_rowid FROM checkpoints
+            UNION ALL
+            SELECT thread_id, rowid AS sort_rowid FROM writes
+        )
+        GROUP BY thread_id
+        ORDER BY latest_rowid DESC
+        """
+    ).fetchall()
+
+    result = []
+    for (thread_id, _latest_rowid) in rows:
+        try:
+            messages = get_messages(thread_id)
+        except Exception:
+            messages = []
+
+        title = derive_session_title(messages) if messages else thread_id
+        result.append({
+            "thread_id": thread_id,
+            "title": title
+        })
 
     return result
 
